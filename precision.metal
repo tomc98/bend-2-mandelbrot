@@ -89,6 +89,12 @@ kernel void reference_orbit(device const uint* center [[buffer(0)]],
 
 // Each lane evaluates independent convolution columns. Carry propagation and
 // rounding use the same radix and rounding rule as the serial multiplier.
+void mp_round_columns(threadgroup const ulong* columns,device uint* out,device uint* work,uint n) {
+  ulong carry=0;
+  for(uint k=0;k<2*n;k++){ulong value=columns[k]+carry;work[k]=uint(value)&65535;carry=value>>16;}
+  uint rounded=work[n-2]>=32768;
+  for(uint i=0;i<n;i++){uint value=work[i+n-1]+rounded;out[i]=value&65535;rounded=value>>16;}
+}
 void mp_mul_parallel(device const uint* a,device const uint* b,device uint* out,
                      device uint* work,uint n,threadgroup ulong* columns,uint tid,uint lanes) {
   for(uint k=tid;k<2*n;k+=lanes) {
@@ -98,11 +104,34 @@ void mp_mul_parallel(device const uint* a,device const uint* b,device uint* out,
     columns[k]=sum;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if(tid==0) {
+  if(tid==0)mp_round_columns(columns,out,work,n);
+  threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup);
+}
+void mp_products_parallel(device const uint* zr,device const uint* zi,device uint* rr,
+                          device uint* ii,device uint* cross,uint n,
+                          threadgroup ulong* columns,uint tid,uint lanes) {
+  for(uint k=tid;k<2*n;k+=lanes) {
+    ulong real=0,imaginary=0,mixed=0;
+    uint begin=k>=n?k-n+1:0,end=min(k+1,n);
+    for(uint i=begin;i<min(end,(k+1)/2);i++) {
+      ulong ar=zr[i],ai=zi[i],br=zr[k-i],bi=zi[k-i];
+      real+=2*ar*br;imaginary+=2*ai*bi;mixed+=ar*bi+ai*br;
+    }
+    if(!(k&1)&&k/2<n){ulong ar=zr[k/2],ai=zi[k/2];real+=ar*ar;imaginary+=ai*ai;mixed+=ar*ai;}
+    columns[k]=real;columns[2*n+k]=imaginary;columns[4*n+k]=mixed;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(tid<3) {
+    threadgroup const ulong* product=columns+2*n*tid;
+    device uint* out=tid==0?rr:tid==1?ii:cross;
     ulong carry=0;
-    for(uint k=0;k<2*n;k++){ulong value=columns[k]+carry;work[k]=uint(value)&65535;carry=value>>16;}
-    uint rounded=work[n-2]>=32768;
-    for(uint i=0;i<n;i++){uint value=work[i+n-1]+rounded;out[i]=value&65535;rounded=value>>16;}
+    for(uint k=0;k<n-2;k++)carry=(product[k]+carry)>>16;
+    ulong guard=product[n-2]+carry;
+    uint rounded=(uint(guard)&65535)>=32768;carry=guard>>16;
+    for(uint i=0;i<n;i++) {
+      ulong value=product[i+n-1]+carry;carry=value>>16;
+      uint limb=(uint(value)&65535)+rounded;out[i]=limb&65535;rounded=limb>>16;
+    }
   }
   threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup);
 }
@@ -126,9 +155,13 @@ kernel void reference_orbit_parallel(device const uint* center [[buffer(0)]],
     if(tid==0){float2 value=float2(mp_float(zr,scratch[8*n],n),mp_float(zi,scratch[8*n+1],n));orbit[k]=value;if(dot(value,value)>256)*length=k+1;}
     threadgroup_barrier(mem_flags::mem_device);
     if(*length==k+1)return;
-    mp_mul_parallel(zr,zr,rr,work,n,columns,tid,lanes);
-    mp_mul_parallel(zi,zi,ii,work,n,columns,tid,lanes);
-    mp_mul_parallel(zr,zi,cross,work,n,columns,tid,lanes);
+    // Three products fit in the existing scratch through 5,440 fractional bits.
+    if(n<=341)mp_products_parallel(zr,zi,rr,ii,cross,n,columns,tid,lanes);
+    else {
+      mp_mul_parallel(zr,zr,rr,work,n,columns,tid,lanes);
+      mp_mul_parallel(zi,zi,ii,work,n,columns,tid,lanes);
+      mp_mul_parallel(zr,zi,cross,work,n,columns,tid,lanes);
+    }
     if(tid==0) {
       mp_twice(cross,n);
       bool ns=mp_signed_add(rr,false,ii,true,nr,n);

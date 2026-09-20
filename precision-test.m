@@ -2,9 +2,11 @@
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 struct Config { uint32_t limbs,iterations,real_negative,imag_negative,start,stop; };
 int main(int argc,const char**argv) { @autoreleasepool {
-  if(argc<3||argc>5) return 2;
+  bool dump_state=argc==6&&!strcmp(argv[5],"--state");
+  if(argc<3||argc>6||(argc==6&&!dump_state)) return 2;
   NSData* input=[NSData dataWithContentsOfFile:@(argv[1])];
   struct Config config; memcpy(&config,input.bytes,sizeof config);
   id<MTLDevice> device=MTLCreateSystemDefaultDevice();
@@ -20,7 +22,7 @@ int main(int argc,const char**argv) { @autoreleasepool {
   id<MTLBuffer> orbit=[device newBufferWithLength:config.iterations*8 options:MTLResourceStorageModeShared];
   id<MTLBuffer> length=[device newBufferWithLength:4 options:MTLResourceStorageModeShared];
   id<MTLCommandQueue> queue=[device newCommandQueue];
-  unsigned chunk=argc==5?(unsigned)atoi(argv[4]):config.iterations;
+  unsigned chunk=argc>=5?(unsigned)atoi(argv[4]):config.iterations;
   double gpu_ms=0;
   for(unsigned start=0;start<config.iterations;start+=chunk) {
     config.start=start;config.stop=MIN(start+chunk,config.iterations);
@@ -34,4 +36,8 @@ int main(int argc,const char**argv) { @autoreleasepool {
   uint32_t n=*(uint32_t*)length.contents;
   fprintf(stderr,"device=%s bits=%u points=%u GPU_ms=%.3f\n",device.name.UTF8String,(config.limbs-1)*16,n,gpu_ms);
   fwrite(&n,4,1,stdout);fwrite(orbit.contents,8,n,stdout);
+  if(dump_state) {
+    fwrite(scratch.contents,4,config.limbs*2,stdout);
+    fwrite((const uint32_t*)scratch.contents+config.limbs*8,4,2,stdout);
+  }
 }}

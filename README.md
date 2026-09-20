@@ -51,6 +51,8 @@ Actual 3840 × 2160 output: [seahorse](evidence/seahorse-4k.png), [100-order ant
 
 `precision.metal` computes the reference orbit using variable-length radix-65536 integer limbs on Metal. Its `deep_pixels` kernel evaluates independent pixels directly into a contiguous GPU buffer. Below the moderate-depth float cutoff, separate mantissas and exponents keep a displacement of `1e-1000` from underflowing to zero. Fusing linear and quadratic terms removes redundant normalization; every orbit iteration, escape check, rebase and glitch check remains. Detected numerical cancellation requests direct multiprecision GPU repair. Reference work is dispatched in bounded chunks. The exact `i` orbit has a GPU shortcut; nearby views reuse that exact anchor while keeping their actual pixel displacement. General centers use cooperative multiprecision multiplication: 32 GPU lanes through 256 fractional bits and 128 lanes above that, with exact integer convolution columns followed by the original carry/rounding rule. Orbit steps remain sequential because each depends on the previous step.
 
+Through 5,440 fractional bits, each generic reference step computes its three independent products together. Symmetric convolution terms share their input loads, then three GPU lanes independently carry and round the real square, imaginary square and cross product directly into separate outputs. This removes four barriers per step and the intermediate limb-buffer round trip while preserving the fixed-point result. The three products fit the existing threadgroup scratch allocation; larger precisions use the previous multiplication path.
+
 `worker.c` connects the Bend effect protocol and Metal buffers. Packing reads the flat buffer for deep views and traverses the Bend quadtree for ordinary views. The deep path avoids building an image tree and serializing the reference orbit into Bend objects. Every GPU frame verifies actual fractal dispatch through its selected engine and checks command-buffer errors. Logs include the actual Metal device, engine, reference cache hit/miss, reference lane count, reference/pixel/repair GPU timing, reference wall time, pixel wall time and total pre-packing wall time. A cache hit with `reference_GPU_ms=0` means no reference dispatch was needed; zero repairs means the glitch detector requested none. AppKit/CoreAnimation displays the result. CPU work consists of window/input/HUD orchestration, rational **camera** bookkeeping, serialization and Bend ownership cleanup. No CPU orbit/reference/repair/color renderer is used in the default application. Decimal orbit calculations occur only in independent offline validation scripts.
 
 `scaled.bend` and `perturbation.bend` retain the Bend GPU implementation for comparison. Run `MANDELBROT_BEND_DEEP=1 ./run.sh` to select it explicitly. The default is the faster dedicated Metal deep kernel; neither mode renders deep fractal pixels on the CPU.
@@ -59,7 +61,27 @@ This is scalable but **finite** precision. The current worker resource budget is
 
 ## Verification and measurements
 
-### Current deep renderer
+### Faster uncached references
+
+September 20, 2026, Apple M4 Pro, 48 GiB RAM, Metal, Bend 2.0.16. Seven alternating paired runs compare this branch with `v0.1.0`, using one worker, unchanged 16,384-iteration budgets and native pixel sampling. Timings include generating an uncached generic reference and returning the first 256 × 256 tile of a 2200 × 1560 view. Process and shader startup are excluded.
+
+| Reference precision | v0.1.0 median / p95 | Fused products median / p95 | Median speedup |
+|---|---:|---:|---:|
+| 320 bits, span 1e-68 | 82.0 / 90.2 ms | 44.1 / 44.7 ms | 1.86× |
+| 1,088 bits, span 1e-300 | 231.0 / 232.0 ms | 109.8 / 111.0 ms | 2.10× |
+| 3,424 bits, span 1e-1000 | 829.0 / 832.6 ms | 370.9 / 376.5 ms | 2.24× |
+
+These generic cases share center `-.743643887037151 + .131825904205330i`, which escapes after 3,087 iterations and becomes visually uniform at these depths. Two 320-bit bounded workloads exercise the full 16,384-iteration reference budget: the parabolic center `-.75 + 0i` improved from 444.1 to 241.4 ms, and a period-three interior from 440.9 to 235.3 ms. Independent Decimal workload samples agree at 150 and 200 decimal digits. The reference-only optimization leaves cached full-frame performance essentially unchanged: four 2200 × 1560 workloads ranged from 0.5% faster to 1.2% slower in median time. All paired tiles and whole-image hashes match. These measurements establish a faster response to reference cache misses; pixel iteration cost remains.
+
+[Raw paired measurements](evidence/fused-reference/production.json) include GPU reference timing, coordinates, individual runs and hashes. [Exact-state validation](evidence/fused-reference/exact-state.json) compares every emitted orbit float and final fixed-point limbs/signs with the saved shader, then checks the final state against an independent Python-integer oracle. All 36 cases pass from 48 through 16,384 bits, including both sides of the fused-kernel boundary. [Serial/chunked reference checks](evidence/fused-reference/reference-validation.json), [six-depth pixel/Decimal checks](evidence/fused-reference/acceleration-validation.json), and [region, repair, cancellation and recovery checks](evidence/fused-reference/batches-validation.json) also pass. The Bend laws/proofs are unchanged and pass the build.
+
+```sh
+python3 benchmark_fused_reference.py /path/to/v0.1.0/worker
+python3 validate_reference_state.py /path/to/v0.1.0/precision.metal
+python3 evidence/fused-reference/workload_audit.py
+```
+
+### Saved v0.1.0 deep renderer
 
 September 20, 2026, Apple M4 Pro, 48 GiB RAM, Metal, Bend 2.0.16. Paired warm runs use the same **2200 × 1560 actual pixels, one worker, 256-pixel tiles, coordinates, iterations and palette**. Three runs per implementation are interleaved; compilation and warm-up are excluded. Time includes rendering, repairs, packing, IPC and stitching the whole image. Every compared full image is byte-identical.
 
